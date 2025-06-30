@@ -33,6 +33,8 @@ with open(image_path, "rb") as f:
 
 # Feature extraction
 feat = extract_noise_features(img_bytes, selected_channels=["Y", "Cb", "Cr"])
+# pca = joblib.load("models/pca_model.joblib")
+# feat = pca.transform(feat)
 feat = feat.reshape(1, -1)  # (1, FEATURE_SIZE)
 
 # f_model

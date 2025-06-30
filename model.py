@@ -14,8 +14,7 @@ import random
 from datasets import Dataset
 import pandas as pd
 import joblib
-
-
+# from sklearn.decomposition import PCA
 
 # =============== CONFIG ===============
 FAKE_ARROW_DIR = "/medias/db/ImagingSecurity_misc/sitcharn/paper_reproduction/cache/datasets/nebula___df-arrow/default/0.0.0/93117d58649bcf660f80fecf2122fac1f59d0453"
@@ -24,14 +23,16 @@ REAL_DIR = "/medias/db/VoxCeleb2/alaska2"
 SYNTHBUSTER_DIR = "/medias/db/ImagingSecurity_misc/sitcharn/paper_reproduction/dataset/resized_data_Synthbuster"
 BLOCK_SIZE = 8
 NUM_BLOCKS = 100
-CHANNELS = ["Y", "Cb", "Cr"]
+# CHANNELS = ["Y", "Cb", "Cr"]
 MAX_REAL_IMAGES = 100
-FEATURE_SIZE = int((NUM_BLOCKS * (NUM_BLOCKS - 1) / 2) * len(CHANNELS))  # Corrélation triangulaire
 
 # =============== FEATURE EXTRACTION ===============
-def extract_noise_features(image_bytes, selected_channels=CHANNELS):
+def extract_noise_features(image_bytes, selected_channels):
+
+    FEATURE_SIZE = int((NUM_BLOCKS * (NUM_BLOCKS - 1) / 2) * len(selected_channels))  # Corrélation triangulaire
+
     try:
-        print("Selected channels: ", selected_channels)
+        # print("Selected channels: ", selected_channels)
         img_array = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         if img is None:
@@ -59,11 +60,34 @@ def extract_noise_features(image_bytes, selected_channels=CHANNELS):
             if len(blocks) == 0:
                 continue
 
-            while len(blocks) < NUM_BLOCKS:
-                blocks += blocks  # réplication
-            blocks = blocks[:NUM_BLOCKS]
+            # while len(blocks) < NUM_BLOCKS:
+            #     blocks += blocks  # réplication
+            # blocks = blocks[:NUM_BLOCKS]
 
-            selected_blocks = np.stack(blocks, axis=1)
+            # selected_blocks = np.stack(blocks, axis=1)
+
+            # Calcul des statistiques pour chaque bloc
+            blocks_np = np.array(blocks)  # shape: (nb_blocs, 64)
+            block_means = np.mean(blocks_np, axis=1)
+            block_vars = np.var(blocks_np, axis=1)
+
+            # Nombre de blocs à sélectionner
+            T = min(NUM_BLOCKS, len(blocks_np))
+
+            # Sélection des T blocs à plus faible moyenne et variance
+            top_mean_indices = np.argsort(block_means)[:T]
+            top_var_indices = np.argsort(block_vars)[:T]
+            selected_indices = np.intersect1d(top_mean_indices, top_var_indices)
+
+            # Si intersection trop faible, on complète avec les meilleurs blocs restants
+            if len(selected_indices) < T:
+                union_indices = np.union1d(top_mean_indices, top_var_indices)
+                missing = T - len(selected_indices)
+                to_add = [idx for idx in union_indices if idx not in selected_indices][:missing]
+                selected_indices = np.concatenate([selected_indices, to_add])
+
+            selected_blocks = blocks_np[selected_indices].T  # .T pour avoir shape (64, T)
+
             Rc = np.corrcoef(selected_blocks)
             if np.isnan(Rc).any():
                 continue
@@ -110,6 +134,20 @@ def train_classifiers(X, y, gen_labels):
     N = len(np.unique(gen_indices))
 
     print(f"\n📦 Nombre de générateurs différents : {N}")
+
+
+    # Réduction de dimension
+    # print(f"🔻 Réduction de dimension avec PCA...")
+    # pca = PCA(n_components=6000)  # ou n_components='auto' + variance_target
+    # X = pca.fit_transform(X)
+    # print(f"✅ Nouvelle shape des features after PCA: {X.shape}")
+
+    # Sauvegarde du modèle PCA
+    # joblib.dump(pca, "models/pca_model.joblib")
+    # print("💾 PCA sauvegardée")
+
+
+
     print("🔄 Split des données pour les modèles...")
     X_train, X_test, gen_train, gen_test, y_train, y_test, gen_labels_train, gen_labels_test = train_test_split(
         X, gen_indices, y, gen_labels, test_size=0.3, random_state=42
@@ -221,58 +259,59 @@ def train_classifiers(X, y, gen_labels):
 # =============== MAIN PIPELINE ===============
 if __name__ == "__main__":
 
-    CHANNELS = ["Y", "Cb", "Cr"]
+    # CHANNELS = ["Y", "Cb", "Cr"]
     MAX_REAL_IMAGES = 100
-    FEATURE_SIZE = int((NUM_BLOCKS * (NUM_BLOCKS - 1) / 2) * len(CHANNELS))  # Corrélation triangulaire
     auc_results = []
     MAX_IMAGES = 10000
     auc_results_OOD = []
     acc_OOD = []
 
-    X_test_OOD, y_test_OOD, generator_labels_OOD = [], [], []
-    success_count_ood, fail_count_ood = 0, 0
-    fake_ood = sorted(
-            glob(os.path.join(SYNTHBUSTER_DIR, "**", "*.jpg"), recursive=True)
-            + glob(os.path.join(SYNTHBUSTER_DIR, "**", "*.png"), recursive=True)
-        )
-
-    success_count_fake, fail_count = 0, 0
-
-    for path in tqdm(fake_ood, desc="Extracting fake image features"):
-        try:
-            with open(path, "rb") as f:
-                img_bytes = f.read()
-                gen_name = os.path.basename(os.path.dirname(path))
-                # print("gen_name: ", gen_name)
-                feat = extract_noise_features(img_bytes, selected_channels=["Y"])
-                X_test_OOD.append(feat)
-                y_test_OOD.append("fake")
-                generator_labels_OOD.append(gen_name)
-                success_count_fake += 1
-        except Exception:
-            fail_count += 1
-    
-    N_OOD = len(np.unique(generator_labels_OOD))
-
-    X_test_OOD = np.array(X_test_OOD, dtype=np.float32)
-    y_test_OOD = np.array(y_test_OOD)
-
-    print("X_test_OOD shape: ", X_test_OOD.shape)
-    print("y_test_OOD shape: ", y_test_OOD.shape)
-
-    print("For OOD fake:")
-    print(f"✅ Total features extraites: {success_count_fake}")
-    print(f"❌ Images ignorées: {fail_count}")
-    print(f"📊 Total analysé: {success_count_fake + fail_count}")
-    print(f"📦 Générateurs détectés: {set(generator_labels_OOD)}")
-
-    for MAX_IMAGES in [40000]:
+    for MAX_IMAGES in [20000, 40000]:
         auc_results = []
-        # for CHANNELS in [["Y"], ["Cb"], ["Cr"], ["Y", "Cb"], ["Y", "Cr"], ["Cb", "Cr"], ["Y", "Cb", "Cr"]]:
-        for CHANNELS in [["Cb", "Cr"]]:
+        for CHANNELS in [["Y"], ["Cb"], ["Cr"], ["Y", "Cb"], ["Y", "Cr"], ["Cb", "Cr"], ["Y", "Cb", "Cr"]]:
+        # for CHANNELS in [["Cb", "Cr"]]:
 
             print("-----"*50)
             print(f"For channels: {CHANNELS}: ")
+            FEATURE_SIZE = int((NUM_BLOCKS * (NUM_BLOCKS - 1) / 2) * len(CHANNELS))  # Corrélation triangulaire
+            X_test_OOD, y_test_OOD, generator_labels_OOD = [], [], []
+            success_count_ood, fail_count_ood = 0, 0
+            fake_ood = sorted(
+                    glob(os.path.join(SYNTHBUSTER_DIR, "**", "*.jpg"), recursive=True)
+                    + glob(os.path.join(SYNTHBUSTER_DIR, "**", "*.png"), recursive=True)
+                )
+
+            success_count_fake, fail_count = 0, 0
+
+            for path in tqdm(fake_ood, desc="Extracting fake image features"):
+                try:
+                    with open(path, "rb") as f:
+                        img_bytes = f.read()
+                        gen_name = os.path.basename(os.path.dirname(path))
+                        # print("gen_name: ", gen_name)
+                        feat = extract_noise_features(img_bytes, selected_channels=CHANNELS)
+                        X_test_OOD.append(feat)
+                        y_test_OOD.append("fake")
+                        generator_labels_OOD.append(gen_name)
+                        success_count_fake += 1
+                except Exception:
+                    fail_count += 1
+            
+            N_OOD = len(np.unique(generator_labels_OOD))
+
+            X_test_OOD = np.array(X_test_OOD, dtype=np.float32)
+            y_test_OOD = np.array(y_test_OOD)
+
+            print("X_test_OOD shape: ", X_test_OOD.shape)
+            print("y_test_OOD shape: ", y_test_OOD.shape)
+
+            print("For OOD fake:")
+            print(f"✅ Total features extraites: {success_count_fake}")
+            print(f"❌ Images ignorées: {fail_count}")
+            print(f"📊 Total analysé: {success_count_fake + fail_count}")
+            print(f"📦 Générateurs détectés: {set(generator_labels_OOD)}")
+        
+     
             arrow_files = sorted([
                 os.path.join(FAKE_ARROW_DIR, f) for f in os.listdir(FAKE_ARROW_DIR)
                 if f.startswith("df-arrow-test") and f.endswith(".arrow")
@@ -378,6 +417,9 @@ if __name__ == "__main__":
                 "auc": roc_auc
             })
 
+            # X_test_OOD = pca.transform(X_test_OOD)
+            # print("X_test_OOD shape after PCA: ", X_test_OOD.shape)
+
             f_probs_test_OOD = f_model.predict_proba(X_test_OOD)
             f_preds_test_OOD = f_model.predict(X_test_OOD)
 
@@ -391,7 +433,6 @@ if __name__ == "__main__":
                 print(f"g_preds_test_all_OOD[{i}].shape = {arr.shape}")
             
             final_test_input_OOD = np.concatenate([f_probs_test_OOD, np.stack(g_preds_test_all_OOD, axis=1)], axis=1)
-
 
             # Ajouter ces lignes juste après l'entraînement et évaluation du modèle h :
 
@@ -418,7 +459,7 @@ if __name__ == "__main__":
             })
 
             df = pd.DataFrame(acc_OOD)
-            df.to_csv("acc_OOD_results.csv", index=False)
+            df.to_csv("acc_OOD_results_with_correction.csv", index=False)
             print("✅ Résultats sauvegardés dans acc_OOD_results.csv")
 
             print("\n✅ Entraînement terminé")
@@ -435,21 +476,7 @@ if __name__ == "__main__":
         plt.legend(loc="lower right")
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"ID-TEST_alaska_roc_curves_{MAX_IMAGES}_images.png")  # len(y) = nb total d'images
+        plt.savefig(f"charts/ID-TEST_alaska_roc_curves_{MAX_IMAGES}_images_with_correction.png")  # len(y) = nb total d'images
         plt.show()
 
-        # roc curve on OOD 
-        plt.figure(figsize=(10, 8))
-        for result in auc_results_OOD:
-            plt.plot(result["fpr"], result["tpr"], label=f"{'+'.join(result['channels'])} (AUC={result['auc']:.2f})")
-
-        plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curves par combinaison de canaux")
-        plt.legend(loc="lower right")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(f"OOD_alaska_roc_curves_{MAX_IMAGES}_images.png")  # len(y) = nb total d'images
-        plt.show()
 
